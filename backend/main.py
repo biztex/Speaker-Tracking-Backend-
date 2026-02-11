@@ -7,9 +7,16 @@ import json
 import logging
 from collections import deque
 from typing import Optional
+from pathlib import Path
 
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+
+# Load environment variables from .env file (if it exists)
+# This allows PYANNOTE_HF_TOKEN to be set in .env instead of shell environment
+env_path = Path(__file__).parent / ".env"
+load_dotenv(dotenv_path=env_path)
 
 from config import (
     SAMPLE_RATE,

@@ -8,3 +8,10 @@ scikit-learn>=1.3.0
 # Tools installed before installing this requirements file.
 webrtcvad==2.0.10
 Resemblyzer>=0.1.4
+# Advanced speaker diarization with overlap support
+torch>=2.0.0
+torchaudio>=2.0.0
+pyannote.audio>=3.0.0
+pyannote.core>=5.0.0
+# Environment variable management
+python-dotenv>=1.0.0

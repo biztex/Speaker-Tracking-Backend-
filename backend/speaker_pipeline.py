@@ -1,10 +1,15 @@
 """
 Speaker tracking pipeline: VAD -> segment -> embed -> cluster (fixed N speakers).
 Only the first N distinct speakers are tracked; noise/others are ignored.
+
+Now includes pyannote.audio support for advanced overlapped speaker diarization.
 """
 import struct
+import os
+import logging
 import numpy as np
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
+from collections import deque
 
 try:
     import webrtcvad
@@ -18,12 +23,25 @@ try:
 except ImportError:
     RESEMBLYZER_AVAILABLE = False
 
+try:
+    import torch
+    from pyannote.audio import Pipeline
+    PYANNOTE_AVAILABLE = True
+except ImportError:
+    PYANNOTE_AVAILABLE = False
+
 from config import (
     SAMPLE_RATE,
     MIN_SEGMENT_DURATION_SEC,
     VAD_FRAME_MS,
     VAD_AGGRESSIVENESS,
+    PYANNOTE_MODEL,
+    PYANNOTE_MIN_SPEAKERS,
+    PYANNOTE_MAX_SPEAKERS,
+    PYANNOTE_MIN_DURATION_SEC,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def pcm_bytes_to_float(pcm: bytes) -> np.ndarray:
@@ -135,18 +153,257 @@ def get_speech_segments(
     )
 
 
+class PyannotePipeline:
+    """
+    Advanced speaker diarization using pyannote.audio.
+    Supports overlapped speech detection - can identify when multiple speakers
+    are active simultaneously.
+    """
+    
+    def __init__(self, num_speakers: int = 2):
+        self.num_speakers = max(1, min(5, num_speakers))
+        self.sample_rate = SAMPLE_RATE
+        self._pipeline: Optional[Pipeline] = None
+        self._device = None
+        
+        # Accumulated audio buffer for processing
+        self._audio_buffer: deque[bytes] = deque()
+        self._buffer_duration_sec = 0.0
+        
+        # Speaker tracking state
+        self.speaking_time_ms: Dict[int, int] = {i: 0 for i in range(self.num_speakers)}
+        self._speaker_label_map: Dict[str, int] = {}  # pyannote label -> speaker ID
+        self._last_current_speakers: List[int] = []  # Can have multiple active speakers
+        
+        if PYANNOTE_AVAILABLE:
+            self._initialize_pipeline()
+        else:
+            logger.warning("pyannote.audio not available. Install with: pip install pyannote.audio")
+    
+    def _initialize_pipeline(self):
+        """Initialize pyannote diarization pipeline."""
+        try:
+            hf_token = os.getenv("PYANNOTE_HF_TOKEN") or os.getenv("HF_TOKEN")
+            if not hf_token:
+                logger.warning(
+                    "PYANNOTE_HF_TOKEN not set. pyannote models require HuggingFace token. "
+                    "Get one at https://huggingface.co/settings/tokens"
+                )
+                return
+            
+            # Determine device
+            self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            logger.info(f"Initializing pyannote pipeline on {self._device}")
+            
+            # Load pipeline
+            # Support both old (use_auth_token) and new (token) API versions
+            try:
+                # Try new API first (pyannote >= 3.1)
+                self._pipeline = Pipeline.from_pretrained(
+                    PYANNOTE_MODEL,
+                    token=hf_token
+                ).to(self._device)
+            except TypeError:
+                # Fallback to old API (pyannote < 3.1)
+                self._pipeline = Pipeline.from_pretrained(
+                    PYANNOTE_MODEL,
+                    use_auth_token=hf_token
+                ).to(self._device)
+            
+            # Set min/max speakers
+            self._pipeline.instantiate({
+                "clustering": {
+                    "min_cluster_size": PYANNOTE_MIN_SPEAKERS,
+                    "threshold": None,  # Auto-determine based on num_speakers
+                }
+            })
+            
+            logger.info("Pyannote pipeline initialized successfully")
+        except Exception as e:
+            logger.error(f"Failed to initialize pyannote pipeline: {e}")
+            self._pipeline = None
+    
+    def _map_speaker_label(self, pyannote_label: str) -> int:
+        """
+        Map pyannote speaker label (e.g., 'SPEAKER_00') to numeric speaker ID.
+        Creates mapping on first appearance, respecting num_speakers limit.
+        """
+        if pyannote_label in self._speaker_label_map:
+            return self._speaker_label_map[pyannote_label]
+        
+        # New speaker - assign next available ID
+        if len(self._speaker_label_map) < self.num_speakers:
+            speaker_id = len(self._speaker_label_map)
+            self._speaker_label_map[pyannote_label] = speaker_id
+            if speaker_id not in self.speaking_time_ms:
+                self.speaking_time_ms[speaker_id] = 0
+            return speaker_id
+        
+        # Already at max speakers - map to closest existing speaker
+        # For simplicity, map to speaker 0 (could be improved with similarity matching)
+        return 0
+    
+    def _process_diarization(self, diarization, chunk_start_offset: float = 0.0):
+        """
+        Process pyannote diarization output and update speaking times.
+        Handles overlapping segments correctly - each speaker gets their own duration.
+        
+        Args:
+            diarization: pyannote.core.Annotation object
+            chunk_start_offset: Time offset for this chunk (for streaming)
+        """
+        if not self._pipeline:
+            return
+        
+        current_speakers = set()
+        
+        # Process each segment in the diarization
+        for segment, track, label in diarization.itertracks(yield_label=True):
+            start_sec = segment.start + chunk_start_offset
+            end_sec = segment.end + chunk_start_offset
+            duration_ms = int((end_sec - start_sec) * 1000)
+            
+            if duration_ms <= 0:
+                continue
+            
+            # Map pyannote label to speaker ID
+            speaker_id = self._map_speaker_label(label)
+            
+            # Accumulate speaking time (overlapping segments are counted separately)
+            if speaker_id < self.num_speakers:
+                self.speaking_time_ms[speaker_id] = self.speaking_time_ms.get(speaker_id, 0) + duration_ms
+                current_speakers.add(speaker_id)
+        
+        # Update current speakers (can be multiple due to overlap)
+        self._last_current_speakers = sorted(list(current_speakers))
+    
+    def process(self, pcm_bytes: bytes, stream_start_offset_sec: float = 0.0) -> dict:
+        """
+        Process audio chunk with pyannote diarization.
+        Accumulates audio until minimum duration is reached, then processes.
+        
+        Args:
+            pcm_bytes: PCM audio bytes (16kHz, 16-bit, mono)
+            stream_start_offset_sec: Offset for this chunk (for streaming)
+        
+        Returns:
+            Update dict with currentSpeakerId(s) and speakingTimeMs
+        """
+        if not self._pipeline:
+            # Fallback: return current state
+            return self._current_state()
+        
+        # Add to buffer
+        self._audio_buffer.append(pcm_bytes)
+        chunk_duration = len(pcm_bytes) / (self.sample_rate * 2)  # 2 bytes per sample
+        self._buffer_duration_sec += chunk_duration
+        
+        # Process if we have enough audio
+        if self._buffer_duration_sec >= PYANNOTE_MIN_DURATION_SEC:
+            # Concatenate buffer
+            full_audio = b"".join(self._audio_buffer)
+            audio_float = pcm_bytes_to_float(full_audio)
+            
+            # Convert to torch tensor (pyannote expects (1, T) shape)
+            waveform = torch.tensor(audio_float, dtype=torch.float32).unsqueeze(0)
+            
+            try:
+                # Run diarization
+                diarization = self._pipeline({
+                    "waveform": waveform.to(self._device),
+                    "sample_rate": self.sample_rate
+                })
+                
+                # Process results
+                self._process_diarization(diarization, stream_start_offset_sec)
+                
+                # Clear buffer (keep last small chunk for continuity)
+                keep_duration = PYANNOTE_MIN_DURATION_SEC * 0.3  # Keep 30% for overlap
+                keep_bytes = int(keep_duration * self.sample_rate * 2)
+                if len(full_audio) > keep_bytes:
+                    # Keep last portion
+                    self._audio_buffer.clear()
+                    self._audio_buffer.append(full_audio[-keep_bytes:])
+                    self._buffer_duration_sec = keep_bytes / (self.sample_rate * 2)
+                else:
+                    self._audio_buffer.clear()
+                    self._buffer_duration_sec = 0.0
+                    
+            except Exception as e:
+                logger.warning(f"Pyannote diarization error: {e}")
+                # Clear buffer on error to prevent accumulation
+                self._audio_buffer.clear()
+                self._buffer_duration_sec = 0.0
+        
+        return self._current_state()
+    
+    def _current_state(self) -> dict:
+        """Return current state dict compatible with existing API."""
+        # For compatibility, return the first active speaker as currentSpeakerId
+        # In the future, could extend API to support multiple active speakers
+        current_speaker = self._last_current_speakers[0] if self._last_current_speakers else None
+        
+        return {
+            "event": "speaker",
+            "currentSpeakerId": current_speaker,
+            "speakingTimeMs": {str(i): self.speaking_time_ms.get(i, 0) for i in range(self.num_speakers)},
+            # Additional field for future use (multiple active speakers)
+            "activeSpeakerIds": self._last_current_speakers,
+        }
+    
+    def get_report(self) -> dict:
+        """Final report: list of { id, totalTimeMs } for each speaker."""
+        return {
+            "event": "report",
+            "speakers": [
+                {"id": i, "totalTimeMs": self.speaking_time_ms.get(i, 0)}
+                for i in range(self.num_speakers)
+            ],
+        }
+    
+    def reset(self) -> None:
+        """Reset pipeline state."""
+        self.speaking_time_ms = {i: 0 for i in range(self.num_speakers)}
+        self._speaker_label_map = {}
+        self._last_current_speakers = []
+        self._audio_buffer.clear()
+        self._buffer_duration_sec = 0.0
+
+
 class SpeakerPipeline:
     """
     Tracks up to num_speakers. First N distinct voices become Speaker 0..N-1.
     Extra voices (noise, others) are not assigned.
+    
+    Uses pyannote.audio for advanced overlapped speaker diarization when available,
+    otherwise falls back to Resemblyzer + KMeans clustering.
     """
 
     def __init__(self, num_speakers: int = 2):
         self.num_speakers = max(1, min(5, num_speakers))
         self.sample_rate = SAMPLE_RATE
+        
+        # Try to use pyannote first (best for overlapped speech)
+        self._use_pyannote = False
+        self._pyannote_pipeline: Optional[PyannotePipeline] = None
+        
+        if PYANNOTE_AVAILABLE:
+            try:
+                self._pyannote_pipeline = PyannotePipeline(num_speakers=self.num_speakers)
+                if self._pyannote_pipeline._pipeline is not None:
+                    self._use_pyannote = True
+                    logger.info("Using pyannote.audio for speaker diarization (supports overlapped speech)")
+                else:
+                    logger.info("Pyannote pipeline not initialized, falling back to Resemblyzer")
+            except Exception as e:
+                logger.warning(f"Failed to initialize pyannote, falling back to Resemblyzer: {e}")
+        
+        # Fallback: Resemblyzer + KMeans
         self._encoder: Optional[any] = None
-        if RESEMBLYZER_AVAILABLE:
+        if not self._use_pyannote and RESEMBLYZER_AVAILABLE:
             self._encoder = VoiceEncoder()
+            logger.info("Using Resemblyzer + KMeans for speaker diarization")
+        
         # Cumulative speaking time per speaker (ms)
         self.speaking_time_ms: dict[int, int] = {i: 0 for i in range(self.num_speakers)}
         # Cluster label -> speaker id (filled by first appearance)
@@ -186,7 +443,18 @@ class SpeakerPipeline:
         - currentSpeakerId: int | null
         - speakingTimeMs: { "0": ms, "1": ms, ... }
         - event: "speaker"
+        - activeSpeakerIds: List[int] (when using pyannote, can have multiple)
         """
+        # Use pyannote if available (best for overlapped speech)
+        if self._use_pyannote and self._pyannote_pipeline:
+            result = self._pyannote_pipeline.process(pcm_bytes, stream_start_offset_sec)
+            # Sync state
+            self.speaking_time_ms = self._pyannote_pipeline.speaking_time_ms.copy()
+            if result.get("currentSpeakerId") is not None:
+                self._last_current_speaker = result["currentSpeakerId"]
+            return result
+        
+        # Fallback: Resemblyzer + KMeans (original method)
         from sklearn.cluster import KMeans
 
         audio_float = pcm_bytes_to_float(pcm_bytes)
@@ -259,6 +527,10 @@ class SpeakerPipeline:
 
     def get_report(self) -> dict:
         """Final report: list of { id, totalTimeMs } for each speaker."""
+        # Sync from pyannote if using it
+        if self._use_pyannote and self._pyannote_pipeline:
+            self.speaking_time_ms = self._pyannote_pipeline.speaking_time_ms.copy()
+        
         return {
             "event": "report",
             "speakers": [
@@ -268,7 +540,11 @@ class SpeakerPipeline:
         }
 
     def reset(self) -> None:
-        self.speaking_time_ms = {i: 0 for i in range(self.num_speakers)}
+        if self._use_pyannote and self._pyannote_pipeline:
+            self._pyannote_pipeline.reset()
+            self.speaking_time_ms = self._pyannote_pipeline.speaking_time_ms.copy()
+        else:
+            self.speaking_time_ms = {i: 0 for i in range(self.num_speakers)}
         self._cluster_to_speaker = {}
         self._next_speaker_id = 0
         self._last_current_speaker = None
