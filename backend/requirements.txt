@@ -2,16 +2,12 @@ fastapi==0.115.6
 uvicorn[standard]==0.32.1
 numpy>=1.24.0,<2
 scikit-learn>=1.3.0
-# Optional (needs C++ Build Tools on Windows): pip install webrtcvad Resemblyzer
-# These are now part of the default requirements so multi-speaker diarization
-# works out of the box. On Windows, make sure you have Microsoft C++ Build
-# Tools installed before installing this requirements file.
-webrtcvad==2.0.10
-Resemblyzer>=0.1.4
-# Advanced speaker diarization with overlap support
+#
+# Speaker diarization stack (VAD + embeddings)
+# - Silero VAD is loaded via torch.hub (no extra PyPI package needed)
+# - SpeechBrain provides speaker embeddings for clustering
 torch>=2.0.0
 torchaudio>=2.0.0
-pyannote.audio>=3.0.0
-pyannote.core>=5.0.0
-# Environment variable management
-python-dotenv>=1.0.0
+speechbrain>=0.5.16
+#
+

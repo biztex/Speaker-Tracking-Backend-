@@ -2,7 +2,7 @@
 
 FastAPI server that performs real-time speaker tracking over a WebSocket. It receives raw PCM audio (16 kHz, 16-bit mono), runs VAD and speaker embedding + clustering, and streams back who is speaking and per-speaker timing. No audio is stored.
 
-**Now includes advanced overlapped speaker diarization** using `pyannote.audio` - can detect when multiple speakers are talking simultaneously!
+**Diarization stack:** Silero VAD (via `torch.hub`) for speech activity + SpeechBrain speaker embeddings with KMeans clustering. This keeps the backend lighter than a full pyannote.audio pipeline while still providing good accuracy for multi-speaker sessions.
 
 ## Setup
 
@@ -16,34 +16,19 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-### Advanced Speaker Diarization (pyannote.audio)
+### Speaker Diarization (Silero + SpeechBrain)
 
-For **overlapped speaker detection** (detecting when two people speak at the same time), you need to set up `pyannote.audio`:
+The backend uses:
 
-1. **Get a HuggingFace token:**
-   - Go to https://huggingface.co/settings/tokens
-   - Create a new token (read access is sufficient)
-   - Accept the terms for the `pyannote/speaker-diarization-3.1` model
+- **Silero VAD** (loaded via `torch.hub`) for speech activity detection on 16 kHz mono audio.
+- **SpeechBrain** (`speechbrain/spkrec-ecapa-voxceleb`) to extract speaker embeddings for each detected speech segment.
+- **KMeans clustering** to assign segments to up to N speakers (N is chosen by the client).
 
-2. **Set the token as an environment variable:**
-   ```bash
-   # Windows PowerShell
-   $env:PYANNOTE_HF_TOKEN="your_token_here"
-   
-   # Windows CMD
-   set PYANNOTE_HF_TOKEN=your_token_here
-   
-   # macOS/Linux
-   export PYANNOTE_HF_TOKEN="your_token_here"
-   ```
+This stack:
 
-3. **The backend will automatically use pyannote** when the token is set. If not set, it falls back to Resemblyzer + KMeans clustering (which doesn't handle overlapped speech as well).
-
-**Note:** PyTorch is included in requirements. If you have a GPU, it will be used automatically. On first run, pyannote will download the model (~500MB).
-
-### Fallback Mode (Resemblyzer)
-
-If pyannote is not available, the system uses Resemblyzer + KMeans clustering. Resemblyzer uses PyTorch. If you don't have a GPU, the CPU build is used automatically. On first run, Resemblyzer may download a small pretrained model.
+- ✅ Avoids large pyannote.audio diarization models (~500MB downloads).
+- ✅ Stays relatively lightweight for CPU-only deployments (e.g. Railway).
+- ✅ Provides good accuracy for typical multi-speaker calls.
 
 ## Run
 
@@ -68,17 +53,9 @@ Only the first N distinct speakers (by voice embedding) are tracked; extra voice
 
 ## Speaker Diarization Methods
 
-The backend supports two methods (automatically selected):
+Currently a single method is used:
 
-1. **pyannote.audio** (when `PYANNOTE_HF_TOKEN` is set):
-   - ✅ **Supports overlapped speech** - can detect when multiple speakers talk simultaneously
-   - ✅ More accurate speaker separation
-   - ✅ Better handling of speaker changes
-   - ⚠️ Requires HuggingFace token and downloads ~500MB model on first run
-   - ⚠️ Slightly higher CPU/GPU usage
-
-2. **Resemblyzer + KMeans** (fallback):
-   - ✅ No external token required
-   - ✅ Lighter weight
-   - ❌ Cannot detect overlapped speech (only one speaker at a time)
-   - ❌ Less accurate for rapid speaker changes
+1. **Silero VAD + SpeechBrain embeddings + KMeans**:
+   - ✅ Good accuracy for typical multi-speaker conversations
+   - ✅ Much lighter than pyannote.audio-based diarization
+   - ❌ Does not provide full overlapped-speech segmentation like pyannote.audio
