@@ -13,7 +13,6 @@ from typing import List, Tuple, Optional, Dict
 from collections import deque
 
 import torch
-from speechbrain.pretrained import EncoderClassifier
 
 from config import (
     SAMPLE_RATE,
@@ -171,15 +170,19 @@ class SpeakerPipeline:
         self.num_speakers = max(1, min(5, num_speakers))
         self.sample_rate = SAMPLE_RATE
 
-        # SpeechBrain encoder (single shared model)
+        # SpeechBrain encoder (single shared model) - lazy import to avoid torchaudio version issues
+        self._encoder: Optional[any] = None
         try:
-            self._encoder: Optional[EncoderClassifier] = EncoderClassifier.from_hparams(
+            from speechbrain.pretrained import EncoderClassifier
+            
+            self._encoder = EncoderClassifier.from_hparams(
                 source="speechbrain/spkrec-ecapa-voxceleb",
                 run_opts={"device": _DEVICE},
             )
             logger.info("Loaded SpeechBrain encoder: spkrec-ecapa-voxceleb")
         except Exception as e:
             logger.error("Failed to load SpeechBrain encoder: %s", e)
+            logger.warning("Speaker diarization will fall back to simple time tracking")
             self._encoder = None
 
         # Cumulative speaking time per speaker (ms)
